@@ -30,7 +30,7 @@ backend/
     apps.py               #   Custom apps/personas, reviews, payment (Stripe), usage history
     action_items.py       #   Tasks with due dates, completion status
     vector_db.py          #   Pinecone integration for semantic search
-    knowledge_graph.py    #   Neo4j entity relationships
+    knowledge_graph.py    #   Firestore-backed entity relationships (knowledge nodes/edges)
     fair_use.py           #   Usage limits and soft-cap tracking
     ...                   #   + folders, goals, phone_calls, daily_summaries, trends, imports, etc.
   routers/                # FastAPI route handlers — 42 files, one per feature domain
