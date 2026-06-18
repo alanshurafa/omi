@@ -130,4 +130,4 @@ class TestOmiToolsEnum:
         assert OmiTools.SEARCH_CONVERSATIONS == "search_conversations"
 
     def test_total_tool_count(self):
-        assert len(OmiTools) == 7
+        assert len(OmiTools) == 8

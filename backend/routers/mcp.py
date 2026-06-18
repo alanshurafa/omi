@@ -109,6 +109,52 @@ def get_memories(
     return memories
 
 
+class SearchMemoryResult(BaseModel):
+    id: str
+    content: str
+    category: MemoryCategory
+    relevance_score: float
+
+
+@router.get("/v1/mcp/memories/search", tags=["mcp"], response_model=List[SearchMemoryResult])
+def search_memories(
+    query: str,
+    limit: int = 10,
+    uid: str = Depends(get_uid_from_mcp_api_key),
+):
+    """Semantic search across the user's memories.
+
+    Mirrors the hosted MCP (mcp_sse.py) so the local stdio package and the
+    hosted server return the same ranking and locked-memory handling.
+    """
+    logger.info(f"search_memories {uid} query={sanitize_pii(query)} limit={limit}")
+
+    matches = vector_db.find_similar_memories(uid, query, threshold=0.0, limit=limit)
+    if not matches:
+        return []
+
+    memory_ids = [m['memory_id'] for m in matches]
+    memories = memories_db.get_memories_by_ids(uid, memory_ids)
+    score_map = {m['memory_id']: m.get('score', 0) for m in matches}
+
+    results = []
+    for memory in memories:
+        content = memory.get('content', '')
+        if memory.get('is_locked', False):
+            content = (content[:70] + '...') if len(content) > 70 else content
+        results.append(
+            SearchMemoryResult(
+                id=memory.get('id'),
+                content=content,
+                category=memory.get('category', MemoryCategory.other),
+                relevance_score=round(score_map.get(memory.get('id'), 0), 4),
+            )
+        )
+
+    results.sort(key=lambda r: r.relevance_score, reverse=True)
+    return results
+
+
 class SimpleStructured(BaseModel):
     title: str
     overview: str
