@@ -12,6 +12,11 @@
 
 ## Cycle Log
 
+### Cycle 2 — 2026-06-20 ~23:54 EDT — verdict: **NO BUILD CHANGE**
+- Worker worktree clean at `334656a97` (cycle-1 commit); no new commits, no untracked code, **still no progress file**.
+- No code/migration changes in any ExoCortex worktree. Only runtime artifacts touched: ExoCortex `omi-sync` + `limitless-sync` **logs/state** (`data/import-state/omi-atomic-state.json`, `logs/*sync-20260620.log`) — the EXISTING pull jobs are **live/running**, not dormant. Reviewer note for Phase 0/1: when built, confirm last-success + cursor against `omi-atomic-state.json` rather than trusting a "ran today" claim.
+- Build not started → nothing to ACCEPT/REVISE.
+
 ### Cycle 1 — 2026-06-20 ~23:05 EDT — verdict: **NOTHING TO VERIFY (build not started)**
 
 **What I actually checked (not claims):**
