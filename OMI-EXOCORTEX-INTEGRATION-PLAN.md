@@ -1,92 +1,91 @@
 # Plan: Omi → ExoCortex Integration
 
 **Author:** Alan Shurafa
-**Status:** **Revised against the Phase 0 audit (2026-06-21).** Original: co-evolved (Codex critique → Claude adjudication), 2026-06-18.
-**What this revision does:** the Phase 0 audit found that several of the original plan's premises did not match the running code (the pull path is live and primary, dedup is by `content_fingerprint` not `import_key`, and there are two divergent ingest paths). This version corrects those premises, marks Phase 0 done, and reframes the remaining phases. The one open decision — pull-primary vs push-primary — is laid out at the end. Original is recoverable in git (commit `334656a97`).
+**Status:** **v3 — co-evolved (Codex critique → Claude adjudication, 2026-06-21), grounded in the Phase 0 code audit.** v1 (2026-06-18) was co-evolved on assumptions; v2 corrected premises against the audit; **v3 fixes two correctness flaws Codex caught** (identity granularity, two-path convergence) and adopts a HYBRID direction. Earlier versions recoverable in git (`334656a97`, `58c4f0c1f`).
 
 ## Goal (unchanged)
 
-A durable, near-real-time link that carries Omi's data into ExoCortex so ExoCortex stays the single brain everything queries (via its MCP). The link must preserve what only Omi can produce and let ExoCortex do the knowledge-layer work it does better.
+A durable, near-real-time link that carries Omi's data into ExoCortex so ExoCortex stays the single brain everything queries (via its MCP), preserving what only Omi can produce.
 
 ## The decision this plan encodes (unchanged — validated by the audit)
 
-- **Omi owns the audio layer.** Voiceprint speaker identity (`person_id`), diarization, per-segment timing, prosody/emotion come from raw audio and cannot be recomputed from text. Omi's memory-extraction prompt is genuinely strong.
-- **ExoCortex owns the knowledge layer.** Atomization, multi-layer dedup, provenance/audit, importance scoring, a temporal knowledge graph, consolidation, local-first sensitivity tiers — all stronger there, and multi-source by design.
-- **ExoCortex is text-only.** Feeding it raw transcripts throws away Omi's irreproducible audio layer and still owes the knowledge work.
+- **Omi owns the audio layer** (`person_id`/voiceprint, diarization, timing, prosody) — irreproducible from text.
+- **ExoCortex owns the knowledge layer** (atomization, multi-layer dedup, provenance, importance, temporal KG, consolidation, local-first sensitivity).
+- **Feed Omi's *processed* output** (conversations + memories) into ExoCortex's enrichment. (Audit confirmed it already atomizes both.)
 
-Therefore: **feed Omi's *processed* output (conversations + memories) into ExoCortex's enrichment.** Omi's ears into ExoCortex's brain. (The audit confirmed ExoCortex already atomizes Omi conversations + memories this way.)
+## What the audit + co-evolution established (read first)
 
-## Phase 0 audit corrections (NEW — read this before the rest)
+Build target: ExoCortex (`C:\Users\alan\Project\ExoCortex` Supabase) + `ExoCortex-jobs` (the live pull). Evidence with file:line in `OMI-EXOCORTEX-INTEGRATION-PROGRESS.md`.
 
-The build is in ExoCortex (`C:\Users\alan\Project\ExoCortex` Supabase + `ExoCortex-jobs` scheduled pull). Evidence with file:line is in `OMI-EXOCORTEX-INTEGRATION-PROGRESS.md`. Six corrections:
+1. **Pull is the live path** (`import-omi.mjs`, ~5-min Task Scheduler, ID-set cursor in one local JSON, 537 conversations, both conversations + memories). Healthy by state-file mtime (exact last-run time unverifiable — scheduler query blocked).
+2. **Dedup is by `content_fingerprint`, not Omi id.** `upsert_thought` keys on `sha256(normalized content)` → `original_fingerprints` fallback. **No `import_key` unique index.** `import_key` is metadata/job-level only.
+3. **Two transports diverge in output** (pull: direct PostgREST, salted per-atom fingerprint, `source_type='omi'`; push: `omi-connector→smart-ingest→upsert_thought`, `source_type='omi_conversation'`). The `omi-connector`/`smart-ingest` *file copies* across the two repos are **identical today** (`git diff --no-index`) — a future-drift risk, not active divergence.
+4. **No conversation revision guard** (pull skips by id after first import; only memories compare `updated_at`). Cursor is a single-file SPOF, no last-success timestamp; `--max 50` can miss bursts.
+5. **No Omi monitoring; no alert channel anywhere. `entities` has no external-id field** (Phase 3 needs a migration; live drift documented in `202606110014`). Webhook accepts secret via query string.
 
-1. **The PULL is live and is the system of record — not a dormant safety net.** `ExoCortex-jobs/scripts/omi/import-omi.mjs` runs every 5 min (Task Scheduler `ExoCortex Omi Sync`), healthy (last run 2026-06-21 09:08, 537 conversations, both conversations + memories). → The original "push-primary because an unwatched cron rots" rationale is **moot for Omi**.
-2. **Dedup is by `content_fingerprint`, not by Omi id.** `upsert_thought` keys on `sha256(normalized content)`; **there is no `import_key` unique index anywhere.** `import_key` lives only in `metadata`, used for a non-unique, race-prone job-level lookup. → The original "idempotency by `import_key`" backbone **does not exist; it must be built.**
-3. **Two divergent ingest paths.** Pull writes directly to `brain_thoughts` via PostgREST with a salted fingerprint; push goes `omi-connector → smart-ingest → upsert_thought`. Different `source_type` values, duplicated code across `ExoCortex` and `ExoCortex-jobs`. → Same conversation via both = divergent rows. **Reconciliation is now a first-class task.**
-4. **No revision guard.** Push can let an older payload overwrite a newer record (fingerprint-collision case); pull **conversations never re-import** after first capture (only pull *memories* compare `updated_at`). → Edited conversations are currently lost.
-5. **Cursor is a single-file SPOF.** Pull's cursor is an ID-membership set in one local JSON (`data/import-state/omi-atomic-state.json`, 537 entries), **no persisted last-success timestamp**; the count-based `--max 50` window can silently miss a burst >50 between runs.
-6. **Monitoring is effectively absent and `entities` has no external-id field.** No freshness check, nobody reads `connector_sync_state.last_success_at`, the job-health watcher omits the Omi task, and **no alert channel exists in either repo**; the pull swallows `429`/empty as `exit 0`. `entities` has `aliases`/`canonical_email`/unique `(entity_type, normalized_name)` but no external-id (Phase 3 needs a migration; live schema drift documented in `202606110014`).
+## Direction — HYBRID over one shared identity ledger (co-evolution verdict)
 
-## Direction — CORRECTED: pull-primary today; push is an optional enhancement
+Neither pure push (v1) nor pure pull (v2) is right:
+- **Pull** is proven-live but a weak permanent backbone (5-min latency, single-machine SPOF, burst loss).
+- **Push** removes latency + the local-scheduler SPOF but has setup/security risk and unconfirmed liveness.
 
-- **Recommended:** treat the **live pull as the canonical backbone** and harden it. Layer push on later as a real-time *accelerator* over the **same** idempotency model — not as a replacement. The original push-primary argument rested on dormancy, which the audit disproved.
-- **Alternative (only if sub-minute latency is a real requirement):** commit to push-primary — wire/confirm the Omi webhook, harden the connector, demote pull to reconcile. More work, more risk, needs Omi-app config.
-- Convergence depends on a correct identity model, which **does not exist yet** and is the core of Phase 1.
+**Decision: HYBRID.** Pull = reconciler/backfill (completeness). Push = real-time transport (latency). **Both write through ONE shared exact-id ledger + one canonical atomization contract** — which is also what makes the two paths converge instead of double-writing. The ledger is the load-bearing primitive; the transports are thin over it.
 
-## Identity & idempotency model — target (must be built) vs current
+## Identity & idempotency model — a ledger at the right granularity (Codex P0 fix)
 
-**Current (audit):** `content_fingerprint` dedup only; no exact-id key; ID-set cursor in a local file; `self:` namespace ambiguity unresolved; no revision guard on push; pull conversations never re-import.
+**Do NOT put a unique `import_key` on `brain_thoughts`** — one conversation becomes many atoms, so an object-level key per row would fail or collapse atoms. Instead:
 
-**Target (the goal):**
-- **Object identity:** a stable `import_key` per Omi object, **separate namespaces** `omi:conversation:<id>` / `omi:memory:<id>`. Preserve the existing `omi:conversation:self:<id>` shape — pick ONE canonical form (resolve the `self:` ambiguity) so two key formats can't double-write.
-- **Exact-id idempotency FIRST**, before content-fingerprint/semantic dedup. Add `import_key` as a real column + partial unique index; have the upsert match it before fingerprint.
-- **Replacement by revision:** carry Omi's `updated_at`/revision; an incoming object replaces the stored one only if its revision is newer (no stale write clobbers newer data) — fix the "conversations never re-import" gap.
-- **Memories are derived facts:** ingest with provenance to their source conversation (`omi:conversation:<id>`).
-- **Deletions not propagated by default** (v1) — blind re-pull must never resurrect deleted data. Optional later: mark long-missing objects stale after a grace period.
-- **Semantic dedup is for cross-source consolidation only**, never the first line against retries/collisions.
+- **Object ledger `imported_objects`** keyed by object: `omi:conversation:<id>` / `omi:memory:<id>` (resolve the `self:` form to ONE canonical shape). Columns: `import_key` (unique), `source_type`, `source_revision`/`updated_at`, `source_hash`, `first_seen_at`, `last_seen_at`, `tombstoned_at`, and a link to the produced atoms.
+- **Atom-level keys** for the thoughts a single object expands into: `omi:conversation:<id>:atom:<n>` (stable across re-import), so re-processing updates atoms in place rather than duplicating.
+- **Exact-id (ledger) match runs BEFORE content-fingerprint/semantic dedup.** Fingerprint stays as the cross-source consolidation layer, not the first line against retries.
+- **One canonical atomization/write contract** both transports call (same atom boundaries, `source_type`, fingerprint inputs, metadata) — otherwise pull's salted fingerprint and push's normalized fingerprint never reconcile.
+- **Revision:** replace a stored object only if `source_revision`/`source_hash` is newer (fixes "conversations never re-import"). **Deletions:** not propagated by default, but record tombstones + `last_seen_at`; never direct-insert around ExoCortex's delete guards, and never let local-state loss resurrect a user-deleted row.
+- **Memories** = derived facts, ingested with provenance to their source conversation.
 
-## Phases — UPDATED
+## Phases — UPDATED (sequencing fixed: de-risk the hard part early)
 
-### Phase 0 — Audit current wiring ✅ DONE
-Baseline produced (see `OMI-EXOCORTEX-INTEGRATION-PROGRESS.md` + the six corrections above).
+### Phase 0 — Audit ✅ DONE (baseline in PROGRESS.md)
 
-### Phase 1 — Harden the live pull + monitoring + real idempotency (S–M)
-On the canonical pull path: (a) **two health checks** — run-heartbeat (every run records success/failure) AND freshness/cursor (alert if Omi has newer data than ExoCortex ingested); a single "zero for N days" alarm is wrong. (b) **Durable cursor** off the single-file SPOF, with a persisted last-success timestamp. (c) **Revision-guard** so edited conversations re-import (newer-only). (d) **Exact-id key** (`import_key` column + partial unique index) consulted before the fingerprint. (e) **Reconcile the two-path divergence** (one canonical write path / shared dedup key).
-Acceptance: a dropped item is recovered next pull; a stalled OR auth-expired run alerts; re-pulling creates no duplicates and updates an object only if Omi's revision is newer; an edited conversation re-imports; the same object via pull and push converges to one lineage.
+### Phase 1 — Shared ledger + reconcile the live pull onto it (the core)
+Re-sequenced so the highest-risk step (identity) is dry-run early, not deferred behind "safe" monitoring:
+1. **Read-only inventory** of current Omi rows (counts by `source_type`, atoms per conversation, existing `metadata` keys).
+2. **Define the canonical atomization/write contract + `imported_objects` ledger schema** (object + atom keys, revision/hash/tombstone fields).
+3. **Backfill DRY-RUN** mapping existing thoughts → ledger; prove no collisions / no atom collapse on live data BEFORE any migration commits.
+4. **Route the pull through the contract + ledger** (reconcile/backfill), exact-id before fingerprint.
+5. **Durable cursor + revision/deletion handling** (off the single-file SPOF; persisted last-success; newer-only revision; tombstones).
+6. **Monitoring/alerting** — run-heartbeat AND freshness/cursor check; stop swallowing `429`/empty as success; one real alert channel. (Not "zero risk" — a monitor that calls Omi can false-alert or burn rate budget; build it to fail loud, not silent.)
+Acceptance: dropped item recovered next pull; stalled OR auth-expired run alerts; re-pull creates no duplicates and updates only on newer revision; an edited conversation re-imports; pull and push (when added) converge to one lineage via the ledger.
 
-### Phase 2 — Push as real-time enhancement (M, medium risk)
-Wire/confirm Omi fires `memory_creation` + conversation triggers into `omi-connector`, mapped through the **same** `import_key` + revision model so exact-id idempotency absorbs webhook retries and push/pull collisions. Harden the connector security gaps the audit found (constant-time secret, signature/replay/size limits, event-id-only logs). Push accelerates; it does not fork the model.
-Acceptance: a new Omi conversation appears within seconds; re-delivery + a later pull converge to one lineage, no duplicate.
+### Phase 2 — Push as a real-time transport over the SAME ledger (M)
+Wire/confirm Omi fires into `omi-connector`, mapped through the **same** contract + ledger so exact-id idempotency absorbs retries and push/pull collisions. Harden connector security (constant-time secret, no secret-in-query, signature/replay/size, event-id-only logs). Until the shared contract exists, **disable whichever path overlaps** to avoid double-writes.
 
-### Phase 3 — `person_id` → entity bridge (M) [highest-value new work]
-The connector drops `person_id` (flattens to `"Speaker: text"`). Pass Omi's speaker identity to ExoCortex's **entity** layer keyed on the **stable `person_id`** (`omi:person:<person_id>`), never the display name. Add the smallest schema field (`omi_person_id TEXT` + partial unique index, mirroring `canonical_email`) — confirmed `entities` has no external-id today; verify live schema (`\d entities`) first due to documented drift.
-Acceptance: a known enrolled speaker links thoughts/edges to the existing entity by `person_id`; a name change in Omi does not fork the entity.
+### Phase 3 — `person_id` → entity bridge (M) [highest-value, but verify the premise first]
+**First confirm a stable `person_id` actually exists in the Omi payload** — code currently shows `speaker_id`/`speaker_name` and the connector drops them; `person_id` is not proven. Step 1: capture the raw speaker identifiers into thought `metadata` and inspect real payloads. Only then add the smallest indexed `entities` external-id (`omi_person_id TEXT` + partial unique index, mirroring `canonical_email`; verify live schema first). Keyed on the stable id, never the display name.
+Acceptance: a known speaker links to the existing entity by stable id; a name change doesn't fork it.
 
-### Phase 4 — Raw SDK "live hearing" side-stream (deferred, optional)
-Unchanged: only build if a concrete live-context workflow that can't wait for Omi's processed output exists. Ephemeral, staging-excluded from normal consolidation. Do not start until Phases 1–3 are proven in real use.
+### Phase 4 — Raw SDK side-stream (deferred, optional; unchanged)
+Ephemeral/staging-excluded; only if a concrete can't-wait workflow exists; not before Phases 1–3 prove out.
 
-## Two-path reconciliation (NEW — current top risk)
-Pick the canonical write path and make the other defer to it (or share one dedup key + `source_type`). Resolve the duplicated `omi-connector`/`supabase`/`scripts` trees across `ExoCortex` and `ExoCortex-jobs` (confirm which is authoritative) before changing ingest, or fixes land in the wrong copy.
+## Two-path reconciliation (resolved by the ledger, not by "sharing a key")
+Pull's and push's fingerprints/atoms/source_types are not comparable, so semantic matching is not an idempotency contract. The fix is structural: **one canonical atomization/write contract + the shared ledger**; both transports call it. Also collapse the duplicated `omi-connector`/`smart-ingest` trees to one authoritative copy (identical now — pick one before they drift).
 
-## Security & privacy (unchanged intent; gaps confirmed)
-Harden `omi-connector` before exposing it publicly: dedicated webhook secret (constant-time compare, not via query string), signature + timestamp + replay window, payload size limit checked **before** full parse, idempotent processing, event-id-only logs. Local-first sensitivity tiering still applies (restricted PII blocked before cloud enrichment). The processed feed routes through Omi's cloud (accepted tradeoff); the deferred raw side-stream is the only path that avoids it.
+## The 8 target invariants — current status
+1. Exact-id ledger (object+atom) + revision, separate namespaces — **UNMET (Phase 1 core).**
+2. Exact-id before semantic; memories as derived facts — **UNMET (Phase 1).**
+3. Run-heartbeat + freshness/cursor monitoring — **UNMET (Phase 1).**
+4. Updates by revision; deletions tombstoned not propagated — **PARTIAL (memories only).**
+5. Webhook security — **UNMET (Phase 2).**
+6. `person_id` bridge on stable id — **UNMET + premise unverified (Phase 3).**
+7. Phase 4 deferred/ephemeral — **HELD (correct).**
+8. Cursor/list reconciliation backbone — **PARTIAL (ID-set cursor exists but single-file SPOF; no freshness).**
 
-## The 8 target invariants (goals — current status from the audit)
-1. `import_key` + revision, separate conversation/memory namespaces — **UNMET (build in Phase 1).**
-2. Exact-id idempotency before semantic dedup; memories as derived facts — **UNMET (Phase 1).**
-3. Monitoring = run-heartbeat + freshness/cursor — **UNMET (Phase 1).**
-4. Updates propagate by revision; deletions don't — **PARTIAL (memories only; conversations never re-import).**
-5. Webhook security (secret/signature/replay/size/event-id-only logs) — **UNMET (Phase 2).**
-6. `person_id` bridge keyed on stable id; smallest schema addition — **UNMET (Phase 3; needs migration).**
-7. Phase 4 deferred + ephemeral/staging-excluded — **HELD (not built — correct).**
-8. Reconciliation backbone cursor/list-based; semantic search a bonus — **PARTIAL (list/ID-set cursor exists but is a single-file SPOF; no freshness check).**
-
-## Risks & open questions (updated)
-- **Two-path divergence** is now the top risk (above).
-- **Does Omi's payload include `person_id`?** Phase 3 needs it; the connector currently has the speaker name but drops the id — confirm the id is in the webhook/pull payload, else fall back to enrolled names (weaker).
-- **`entities` live schema drift** (`202606110014`) — verify before the Phase 3 migration.
-- **Cursor durability + burst window** — single-file SPOF, `--max 50` can miss bursts.
-- **Single-user scope** — prefer the smallest reliable pull/push path over generic connector abstractions.
+## Risks (updated)
+- **Identity migration/backfill on the live `brain_thoughts`** is the highest-risk step → dry-run first, never big-bang.
+- **Two transports** must converge through the contract+ledger or they double-write.
+- **person_id may not exist** in the payload (could be `speaker_id`) — verify before Phase 3.
+- **entities live schema drift** (`202606110014`) — `\d entities` before migrating.
+- **Cursor SPOF + burst window**; single-machine scheduler.
+- Keep it single-user-minimal: the ledger is the one necessary new primitive; avoid generic-connector abstractions beyond it.
 
 ## Open decision for Alan
-Pick the Phase 1 build direction now that the plan matches reality: **(A) harden the live pull as canonical** [recommended], or **(B) commit to push-primary**. Phase 1 edits the live ExoCortex pipeline, so this needs an explicit go before code.
+Lock the direction from this stress-tested plan: **HYBRID over a shared ledger** [co-evolution verdict; recommended], or override to pull-only / push-only. Phase 1 starts with read-only inventory + a ledger dry-run (no live mutation) — that first step is safe to run as soon as you pick HYBRID.
