@@ -1,181 +1,92 @@
 # Plan: Omi → ExoCortex Integration
 
 **Author:** Alan Shurafa
-**Status:** Review candidate (co-evolved: Codex critique → Claude adjudication)
-**Date:** 2026-06-18
+**Status:** **Revised against the Phase 0 audit (2026-06-21).** Original: co-evolved (Codex critique → Claude adjudication), 2026-06-18.
+**What this revision does:** the Phase 0 audit found that several of the original plan's premises did not match the running code (the pull path is live and primary, dedup is by `content_fingerprint` not `import_key`, and there are two divergent ingest paths). This version corrects those premises, marks Phase 0 done, and reframes the remaining phases. The one open decision — pull-primary vs push-primary — is laid out at the end. Original is recoverable in git (commit `334656a97`).
 
-## Goal
+## Goal (unchanged)
 
-A durable, near-real-time link that carries Omi's data into ExoCortex so ExoCortex stays the
-single brain everything queries (via its MCP). The link must preserve what only Omi can
-produce and let ExoCortex do the knowledge-layer work it does better.
+A durable, near-real-time link that carries Omi's data into ExoCortex so ExoCortex stays the single brain everything queries (via its MCP). The link must preserve what only Omi can produce and let ExoCortex do the knowledge-layer work it does better.
 
-## The decision this plan encodes
+## The decision this plan encodes (unchanged — validated by the audit)
 
-A code-level comparison of both enrichment pipelines settled the core question:
+- **Omi owns the audio layer.** Voiceprint speaker identity (`person_id`), diarization, per-segment timing, prosody/emotion come from raw audio and cannot be recomputed from text. Omi's memory-extraction prompt is genuinely strong.
+- **ExoCortex owns the knowledge layer.** Atomization, multi-layer dedup, provenance/audit, importance scoring, a temporal knowledge graph, consolidation, local-first sensitivity tiers — all stronger there, and multi-source by design.
+- **ExoCortex is text-only.** Feeding it raw transcripts throws away Omi's irreproducible audio layer and still owes the knowledge work.
 
-- **Omi owns the audio layer.** Voiceprint speaker identity (`person_id`), diarization,
-  per-segment timing, and prosody/emotion come from raw audio and cannot be recomputed later
-  from text. Omi's memory-extraction prompt is also genuinely strong.
-- **ExoCortex owns the knowledge layer.** Atomization, multi-layer dedup, provenance/audit,
-  importance scoring, a temporal knowledge graph, consolidation, and local-first sensitivity
-  tiers are all stronger there, and it is multi-source by design.
-- **ExoCortex is text-only.** It never sees audio, so feeding it *raw* transcripts throws away
-  Omi's irreproducible audio layer and still owes the knowledge work.
+Therefore: **feed Omi's *processed* output (conversations + memories) into ExoCortex's enrichment.** Omi's ears into ExoCortex's brain. (The audit confirmed ExoCortex already atomizes Omi conversations + memories this way.)
 
-Therefore: **feed Omi's *processed* output (conversations + memories) into ExoCortex's
-enrichment; do not bypass Omi's processing for the main feed.** Omi's ears into ExoCortex's
-brain.
+## Phase 0 audit corrections (NEW — read this before the rest)
 
-## Direction: push-primary, pull-reconcile
+The build is in ExoCortex (`C:\Users\alan\Project\ExoCortex` Supabase + `ExoCortex-jobs` scheduled pull). Evidence with file:line is in `OMI-EXOCORTEX-INTEGRATION-PROGRESS.md`. Six corrections:
 
-- **Push** (Omi fires on new data → ExoCortex ingests) gives real-time and does not rot
-  silently. The Limitless pull pipeline sat dormant ~9 months unnoticed; an unwatched cron is
-  the known failure mode.
-- **Pull** (ExoCortex periodically asks Omi for a trailing window) is the safety net for
-  anything the webhook dropped, not the primary path.
-- Convergence depends on a correct identity model (below), not on semantic dedup.
+1. **The PULL is live and is the system of record — not a dormant safety net.** `ExoCortex-jobs/scripts/omi/import-omi.mjs` runs every 5 min (Task Scheduler `ExoCortex Omi Sync`), healthy (last run 2026-06-21 09:08, 537 conversations, both conversations + memories). → The original "push-primary because an unwatched cron rots" rationale is **moot for Omi**.
+2. **Dedup is by `content_fingerprint`, not by Omi id.** `upsert_thought` keys on `sha256(normalized content)`; **there is no `import_key` unique index anywhere.** `import_key` lives only in `metadata`, used for a non-unique, race-prone job-level lookup. → The original "idempotency by `import_key`" backbone **does not exist; it must be built.**
+3. **Two divergent ingest paths.** Pull writes directly to `brain_thoughts` via PostgREST with a salted fingerprint; push goes `omi-connector → smart-ingest → upsert_thought`. Different `source_type` values, duplicated code across `ExoCortex` and `ExoCortex-jobs`. → Same conversation via both = divergent rows. **Reconciliation is now a first-class task.**
+4. **No revision guard.** Push can let an older payload overwrite a newer record (fingerprint-collision case); pull **conversations never re-import** after first capture (only pull *memories* compare `updated_at`). → Edited conversations are currently lost.
+5. **Cursor is a single-file SPOF.** Pull's cursor is an ID-membership set in one local JSON (`data/import-state/omi-atomic-state.json`, 537 entries), **no persisted last-success timestamp**; the count-based `--max 50` window can silently miss a burst >50 between runs.
+6. **Monitoring is effectively absent and `entities` has no external-id field.** No freshness check, nobody reads `connector_sync_state.last_success_at`, the job-health watcher omits the Omi task, and **no alert channel exists in either repo**; the pull swallows `429`/empty as `exit 0`. `entities` has `aliases`/`canonical_email`/unique `(entity_type, normalized_name)` but no external-id (Phase 3 needs a migration; live schema drift documented in `202606110014`).
 
-## Identity & idempotency model (the correctness core)
+## Direction — CORRECTED: pull-primary today; push is an optional enhancement
 
-This is first-class, because push + pull + webhook retries + source edits all collide here.
+- **Recommended:** treat the **live pull as the canonical backbone** and harden it. Layer push on later as a real-time *accelerator* over the **same** idempotency model — not as a replacement. The original push-primary argument rested on dormancy, which the audit disproved.
+- **Alternative (only if sub-minute latency is a real requirement):** commit to push-primary — wire/confirm the Omi webhook, harden the connector, demote pull to reconcile. More work, more risk, needs Omi-app config.
+- Convergence depends on a correct identity model, which **does not exist yet** and is the core of Phase 1.
 
-- **Object identity:** a stable `import_key` per Omi object, in **separate namespaces** for
-  the two object types — `omi:conversation:<id>` and `omi:memory:<id>`. Preserve whatever
-  namespace already exists in ExoCortex (Phase 0 confirms it; e.g. `omi:conversation:self:<id>`)
-  — do not introduce a second key format for the same object.
-- **Replacement semantics:** carry Omi's `updated_at`/revision alongside the key. An incoming
-  object replaces the stored one only if its revision is newer (no stale write clobbers newer
-  data).
-- **Ordering of dedup:** exact/deterministic idempotency by Omi object ID happens **first**,
-  before content fingerprint or semantic reconcile. Semantic dedup is reserved for *cross-source*
-  consolidation (e.g. an Omi memory that restates something captured elsewhere) — it is never
-  the first line of defense against retries or push/pull collisions.
-- **Omi memories are derived facts.** Ingest them with provenance pointing back to their source
-  conversation (`omi:conversation:<id>`) when Omi provides it, so a fact is traceable to the
-  utterance, not floating.
-- **Source mutation:** updates propagate via the revision rule above. **Deletions are not
-  propagated by default** — an explicit, documented choice for v1 (blind re-pull must never
-  resurrect data Omi deleted). A later optional pass may mark previously-seen objects missing
-  from the trailing window as stale after a grace period.
+## Identity & idempotency model — target (must be built) vs current
 
-## Current state — verify before building (Phase 0)
+**Current (audit):** `content_fingerprint` dedup only; no exact-id key; ID-set cursor in a local file; `self:` namespace ambiguity unresolved; no revision guard on push; pull conversations never re-import.
 
-Partly built already; confirm what is actually live, because silent rot is the main risk.
+**Target (the goal):**
+- **Object identity:** a stable `import_key` per Omi object, **separate namespaces** `omi:conversation:<id>` / `omi:memory:<id>`. Preserve the existing `omi:conversation:self:<id>` shape — pick ONE canonical form (resolve the `self:` ambiguity) so two key formats can't double-write.
+- **Exact-id idempotency FIRST**, before content-fingerprint/semantic dedup. Add `import_key` as a real column + partial unique index; have the upsert match it before fingerprint.
+- **Replacement by revision:** carry Omi's `updated_at`/revision; an incoming object replaces the stored one only if its revision is newer (no stale write clobbers newer data) — fix the "conversations never re-import" gap.
+- **Memories are derived facts:** ingest with provenance to their source conversation (`omi:conversation:<id>`).
+- **Deletions not propagated by default** (v1) — blind re-pull must never resurrect deleted data. Optional later: mark long-missing objects stale after a grace period.
+- **Semantic dedup is for cross-source consolidation only**, never the first line against retries/collisions.
 
-- `supabase/functions/omi-connector/index.ts` already **receives Omi webhooks**, reads
-  `transcript_segments` (`speaker_name`/`speaker`/`speakerId`), flattens them to `"Speaker: text"`,
-  and forwards to text ingest. **Verify it is wired to a live Omi integration**, not dormant.
-- An MCP/REST import path also ingests Omi conversations (thoughts carry
-  `import_key: omi:conversation:self:<id>`, `capture_mode: backfill|smart_ingest`). **Verify it
-  still runs**, and on what trailing window.
-- Confirm whether Omi **memories** are ingested today, or only the conversation transcript.
-- Confirm the exact uniqueness/upsert behavior for `import_key` today, including whether
-  `omi:conversation:self:<id>` vs `omi:conversation:<id>` would collide or duplicate.
-- Confirm whether ExoCortex's `entities` schema has any external-identity field (it has
-  `aliases`, `canonical_email`, unique `(entity_type, normalized_name)` — but no obvious
-  external id), since Phase 3 depends on it.
+## Phases — UPDATED
 
-Deliverable: a one-page "what fires, what polls, last-success timestamp, and current
-idempotency/upsert behavior" so the real baseline is known.
+### Phase 0 — Audit current wiring ✅ DONE
+Baseline produced (see `OMI-EXOCORTEX-INTEGRATION-PROGRESS.md` + the six corrections above).
 
-## Target architecture
+### Phase 1 — Harden the live pull + monitoring + real idempotency (S–M)
+On the canonical pull path: (a) **two health checks** — run-heartbeat (every run records success/failure) AND freshness/cursor (alert if Omi has newer data than ExoCortex ingested); a single "zero for N days" alarm is wrong. (b) **Durable cursor** off the single-file SPOF, with a persisted last-success timestamp. (c) **Revision-guard** so edited conversations re-import (newer-only). (d) **Exact-id key** (`import_key` column + partial unique index) consulted before the fingerprint. (e) **Reconcile the two-path divergence** (one canonical write path / shared dedup key).
+Acceptance: a dropped item is recovered next pull; a stalled OR auth-expired run alerts; re-pulling creates no duplicates and updates an object only if Omi's revision is newer; an edited conversation re-imports; the same object via pull and push converges to one lineage.
 
-```
-Omi wearable/app
-   │  (audio → Omi cloud enrichment: diarization, person_id, summary, memories)
-   ▼
-Omi processed output ── push (signed webhook) ──► ExoCortex omi-connector ──┐
-   │                                                                        ├─► ExoCortex ingest
-   └── pull (scheduled, trailing window, reconcile) ────────────────────────┘   (exact-id idempotency →
-                                                                                  atomize, dedup, score, KG, sensitivity)
-                                                              one retrieval surface: ExoCortex MCP
-```
+### Phase 2 — Push as real-time enhancement (M, medium risk)
+Wire/confirm Omi fires `memory_creation` + conversation triggers into `omi-connector`, mapped through the **same** `import_key` + revision model so exact-id idempotency absorbs webhook retries and push/pull collisions. Harden the connector security gaps the audit found (constant-time secret, signature/replay/size limits, event-id-only logs). Push accelerates; it does not fork the model.
+Acceptance: a new Omi conversation appears within seconds; re-delivery + a later pull converge to one lineage, no duplicate.
 
-Raw SDK capture (the "hearing primitive") is a deferred, separate side-stream (Phase 4).
-
-## Phases
-
-### Phase 0 — Audit current wiring (S, low risk)
-Produce the baseline above. No code. Output: which paths are live, last success, exact
-idempotency/upsert behavior, entity external-id capability, and the gap list.
-
-### Phase 1 — Harden pull reconciliation + monitoring (S–M, low risk)
-A dependable trailing-window pull of Omi conversations + memories, idempotent by `import_key`
-with the revision rule. Two independent health checks (a single "zero for N days" alarm is
-wrong — it false-alerts on quiet days and false-succeeds when auth has expired but the job
-still runs):
-1. **Run heartbeat** — every scheduled run records success/failure.
-2. **Freshness check** — compare against the newest source-item timestamp or Omi cursor; alert
-   if Omi has newer data than ExoCortex has ingested.
-Acceptance: a deliberately dropped item is recovered next pull; a stalled or auth-expired run
-alerts; re-pulling a window creates no duplicates and updates an object only if Omi's revision
-is newer.
-
-### Phase 2 — Confirm/upgrade the push path (M, medium risk)
-Ensure the Omi integration fires on `memory_creation` and conversation/transcript triggers
-into `omi-connector` in real time. Map each object to ingest using the namespaced `import_key`
-+ revision. Ingest **both** the transcript (for atomization/recall) and Omi's memories
-(high-precision facts, with source-conversation provenance). Exact-id idempotency absorbs
-webhook retries and push/pull collisions before any semantic step runs.
-Acceptance: a new Omi conversation appears in ExoCortex within seconds; re-delivery and a
-later pull of the same object converge to one lineage with no duplicate.
-
-### Phase 3 — `person_id` → entity bridge (M, medium risk) [highest-value new work]
-The connector currently drops Omi's `person_id`, so ExoCortex re-guesses identity from the
-name string. Pass Omi's speaker identity through to ExoCortex's **entity** layer, keyed on the
-**stable `person_id`** (`omi:person:<person_id>`), never the display name (names aren't stable
-identifiers). If Phase 0 shows no external-identity field on `entities`, add the smallest one
-(e.g. an `external_ids` jsonb, or a typed alias) rather than overloading `canonical_name`.
-Acceptance: a conversation with a known enrolled speaker links its thoughts/edges to the
-existing entity by `person_id`, not a new name-only node; a name change in Omi does not fork
-the entity.
+### Phase 3 — `person_id` → entity bridge (M) [highest-value new work]
+The connector drops `person_id` (flattens to `"Speaker: text"`). Pass Omi's speaker identity to ExoCortex's **entity** layer keyed on the **stable `person_id`** (`omi:person:<person_id>`), never the display name. Add the smallest schema field (`omi_person_id TEXT` + partial unique index, mirroring `canonical_email`) — confirmed `entities` has no external-id today; verify live schema (`\d entities`) first due to documented drift.
+Acceptance: a known enrolled speaker links thoughts/edges to the existing entity by `person_id`; a name change in Omi does not fork the entity.
 
 ### Phase 4 — Raw SDK "live hearing" side-stream (deferred, optional)
-Only build if a concrete live-context workflow that cannot wait for Omi's processed output
-actually exists. If so, use the PR #1 SDK sink to push raw transcripts to a **staging path
-excluded from normal consolidation by default** (ephemeral; not persisted into the main
-knowledge store unless a query explicitly promotes it). This stream accepts the loss of Omi's
-audio-layer enrichment. Do not start it until Phases 1–3 are proven in real use.
+Unchanged: only build if a concrete live-context workflow that can't wait for Omi's processed output exists. Ephemeral, staging-excluded from normal consolidation. Do not start until Phases 1–3 are proven in real use.
 
-## Security & privacy
+## Two-path reconciliation (NEW — current top risk)
+Pick the canonical write path and make the other defer to it (or share one dedup key + `source_type`). Resolve the duplicated `omi-connector`/`supabase`/`scripts` trees across `ExoCortex` and `ExoCortex-jobs` (confirm which is authoritative) before changing ingest, or fixes land in the wrong copy.
 
-- Push adds a public surface, so harden `omi-connector`: a dedicated Omi webhook secret;
-  signature + timestamp verification if Omi supports it; a replay window; a payload size
-  limit; idempotent processing so replays cannot duplicate; and logging of event IDs only,
-  never raw transcript text.
-- ExoCortex's local-first sensitivity tiering still applies: restricted PII is classified
-  before any cloud enrichment and blocked if `restricted`.
-- This design routes data through Omi's cloud (accepted tradeoff for the enrichment). The
-  deferred raw side-stream is the only path that avoids it.
+## Security & privacy (unchanged intent; gaps confirmed)
+Harden `omi-connector` before exposing it publicly: dedicated webhook secret (constant-time compare, not via query string), signature + timestamp + replay window, payload size limit checked **before** full parse, idempotent processing, event-id-only logs. Local-first sensitivity tiering still applies (restricted PII blocked before cloud enrichment). The processed feed routes through Omi's cloud (accepted tradeoff); the deferred raw side-stream is the only path that avoids it.
 
-## Risks & open questions
+## The 8 target invariants (goals — current status from the audit)
+1. `import_key` + revision, separate conversation/memory namespaces — **UNMET (build in Phase 1).**
+2. Exact-id idempotency before semantic dedup; memories as derived facts — **UNMET (Phase 1).**
+3. Monitoring = run-heartbeat + freshness/cursor — **UNMET (Phase 1).**
+4. Updates propagate by revision; deletions don't — **PARTIAL (memories only; conversations never re-import).**
+5. Webhook security (secret/signature/replay/size/event-id-only logs) — **UNMET (Phase 2).**
+6. `person_id` bridge keyed on stable id; smallest schema addition — **UNMET (Phase 3; needs migration).**
+7. Phase 4 deferred + ephemeral/staging-excluded — **HELD (not built — correct).**
+8. Reconciliation backbone cursor/list-based; semantic search a bonus — **PARTIAL (list/ID-set cursor exists but is a single-file SPOF; no freshness check).**
 
-- **Does Omi's integration payload include `person_id`/speaker identity?** Phase 3 needs it;
-  if absent, fall back to enrolled speaker names and match on those (weaker).
-- **Is the current pull live or dormant?** Phase 0 answers it; assume nothing.
-- **Source mutation/deletion:** Phases 1–2 define update behavior; deletion is explicitly not
-  propagated in v1.
-- **Double-enrichment volume:** transcript + memories doubles input; exact-id idempotency
-  first, then measure thought volume after Phase 2.
-- **Single-user scope:** prefer the smallest reliable push/pull path over generic connector
-  abstractions unless Phase 0 shows multiple sources already share the machinery.
+## Risks & open questions (updated)
+- **Two-path divergence** is now the top risk (above).
+- **Does Omi's payload include `person_id`?** Phase 3 needs it; the connector currently has the speaker name but drops the id — confirm the id is in the webhook/pull payload, else fall back to enrolled names (weaker).
+- **`entities` live schema drift** (`202606110014`) — verify before the Phase 3 migration.
+- **Cursor durability + burst window** — single-file SPOF, `--max 50` can miss bursts.
+- **Single-user scope** — prefer the smallest reliable pull/push path over generic connector abstractions.
 
-## How the in-flight PRs connect
-
-- **PR #2 (MCP memory search)** can enrich retrieval, but the reconciliation backbone in
-  Phase 1 should be **list/cursor-based for completeness** — semantic search is a bonus, not
-  the mechanism that guarantees nothing is missed.
-- **PR #1 (SDK transcript sink)** is only relevant if Phase 4 survives the deferral test.
-
-## What the co-evolution changed (Codex → Claude)
-
-Codex raised 6 contested points and 2 clarifications; all were accepted or resolved:
-1. Identity model upgraded: `import_key` + revision + separate conversation/memory namespaces.
-2. Exact-id idempotency ordered *before* semantic dedup; memories treated as derived facts.
-3. Monitoring split into run-heartbeat + freshness/cursor check (killed the "zero for N days" trap).
-4. Source mutation/deletion semantics defined (updates propagate; deletions don't, by default).
-5. Webhook security hardened (dedicated secret, signature/replay/size limits, event-id-only logs).
-6. `person_id` bridge keyed on the stable id, not display name; smallest schema addition.
-7. Phase 4 (raw side-stream) deferred and made ephemeral/staging-excluded — anti over-engineering.
-8. Reconciliation backbone clarified as cursor/list-based; PR #2 is a retrieval bonus.
+## Open decision for Alan
+Pick the Phase 1 build direction now that the plan matches reality: **(A) harden the live pull as canonical** [recommended], or **(B) commit to push-primary**. Phase 1 edits the live ExoCortex pipeline, so this needs an explicit go before code.
