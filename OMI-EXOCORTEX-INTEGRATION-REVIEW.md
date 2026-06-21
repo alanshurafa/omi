@@ -12,6 +12,8 @@
 
 ## Cycle Log
 
+### Cycle 8 — 2026-06-21 ~06:09 EDT — **NO CHANGE** (clean at `25b65ddf5`; no progress file; no code edits in 70 min). Final summary scheduled for the post-06:30 cutoff cycle.
+
 ### Cycle 7 — 2026-06-21 ~05:07 EDT — **NO CHANGE** (clean at `cb051f73f`; no progress file; no code edits in 70 min).
 
 ### Cycle 6 — 2026-06-21 ~04:05 EDT — **NO CHANGE** (clean at `32465118d`; no progress file; no code edits in 70 min).
