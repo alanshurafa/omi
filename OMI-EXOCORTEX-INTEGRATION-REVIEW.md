@@ -12,6 +12,22 @@
 
 ## Cycle Log
 
+### FINAL SUMMARY — 2026-06-21 ~06:33 EDT — overnight watch closed (loop STOPPED)
+
+**Outcome: the build never started during the overnight watch.** 9 checks across ~23:05 → 06:33 EDT (cycles 1–8 + this final), all NO-CHANGE: worker worktree never moved past my cycle-1 commit, **no `OMI-EXOCORTEX-INTEGRATION-PROGRESS.md` was ever created**, and no integration code/migrations were touched in either the Omi worktree or any ExoCortex worktree.
+
+- **Plan:** present and internally sound (`OMI-EXOCORTEX-INTEGRATION-PLAN.md`, v2026-06-18, co-evolved). Backed up to the fork this watch (was untracked).
+- **Verdicts:** nothing built → **nothing to ACCEPT or REVISE.** All phases remain NOT STARTED.
+- **Live-infra observation (Phase-0 relevant):** ExoCortex's existing `omi-sync` + `limitless-sync` jobs were seen writing fresh logs/state during the night → the current pull path is **live, not dormant**. When Phase 0/1 is built, verify last-success + cursor against `data/import-state/omi-atomic-state.json` rather than trusting a "ran today" claim.
+- **Baseline ground truth (recorded for fast adversarial checks):** omi-connector drops `person_id` (flattens to `"Speaker: text"`, `index.ts:156`); current `import_key` = `omi:<surface>:<uid>:<sourceId>` (`index.ts:345`).
+
+**What the worker must produce first (then this reviewer engages with the full break-tests):**
+1. `OMI-EXOCORTEX-INTEGRATION-PROGRESS.md` naming the build branch/worktree (especially on the ExoCortex side).
+2. The Phase 0 baseline one-pager (which I then verify against the actual code).
+3. Phase 1 pull-reconcile code + the two independent health checks (run-heartbeat AND freshness/cursor).
+
+**Reviewer status:** ready. The framework, per-phase break-tests, and the 8 non-negotiable invariants are pre-loaded below. To resume the autonomous watch, re-launch the loop prompt. The loop is now stopped (no further wakeups scheduled).
+
 ### Cycle 8 — 2026-06-21 ~06:09 EDT — **NO CHANGE** (clean at `25b65ddf5`; no progress file; no code edits in 70 min). Final summary scheduled for the post-06:30 cutoff cycle.
 
 ### Cycle 7 — 2026-06-21 ~05:07 EDT — **NO CHANGE** (clean at `cb051f73f`; no progress file; no code edits in 70 min).
