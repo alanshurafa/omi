@@ -11,10 +11,33 @@
 | Phase | Status |
 |---|---|
 | 0 — Audit current wiring | ✅ **DONE** (baseline below) |
-| 1 — Harden pull reconcile + monitoring | ⏸ **BLOCKED on one decision** (canonical path — see below) |
+| 1 — Shared ledger + harden pull | 🔄 **IN PROGRESS** — direction LOCKED (HYBRID); read-only inventory + backfill dry-run **DONE & PASSED**; mutation **gated at checkpoint** (see Phase 1 log) |
 | 2 — Push path | NOT STARTED |
 | 3 — person_id → entity bridge | NOT STARTED (needs `entities` migration — confirmed) |
 | 4 — Raw SDK side-stream | NOT BUILT (correct — deferred) |
+
+---
+
+## Phase 1 log — 2026-06-22 — read-only proof complete (CHECKPOINT before any mutation)
+
+Direction **locked: HYBRID over a shared ledger** (Alan, 2026-06-22). Executed the safe read-only opening; **nothing written to the live DB.**
+
+**Live inventory (`brain_thoughts`, project rxsorf…):** `omi`=3225 · `omi_memory`=264 · `omi_conversation`(push)=79 · `omi_daily_summary`=0. Pull rows carry `provider_event_id` (Omi conv UUID) + `atom_index` on 3225/3225; memories carry `omi_memory_id` + `omi_updated_at`; **no `import_key`, no `person_id`/`speaker_id`** on pull rows.
+
+**Backfill dry-run (read-only, scratch `omi-ledger-*.mjs`):**
+- Atom key `(provider_event_id, atom_index)` → 3225 rows / **3225 distinct keys / 0 collisions**; 626 conversations; atoms/conv min 1, median 4, max 86. **Clean.**
+- `omi_memory_id` → 264/264 unique. **Clean.**
+- **Cross-path duplication: 20 conversations** appear via BOTH pull (`omi`) and push (`omi_conversation`, `import_key=omi:conversation:self:<id>`) — 79 push rows duplicating content already present as pull atoms. **Confirmed live data-quality issue.**
+
+**Validated ledger design (backfillable from existing metadata, no content re-hash):**
+- `imported_objects` keyed by object: `omi:conversation:<provider_event_id>` / `omi:memory:<omi_memory_id>`; columns `source_type, source_revision (omi_updated_at), source_hash, first_seen_at, last_seen_at, tombstoned_at`.
+- Atom keys `omi:conversation:<id>:atom:<atom_index>` link ledger object → its `brain_thoughts` rows.
+
+**Checkpoint — next steps MUTATE production, each gated separately:**
+1. **(additive, low-risk)** create `imported_objects` + backfill from existing metadata. New table; `brain_thoughts` untouched; reversible by drop.
+2. **(deletes rows — explicit approval)** reconcile the 20 cross-path dups (pull is canonical → remove the 79 push `omi_conversation` rows for those convs).
+3. **(modifies live pull)** route `import-omi.mjs` through the ledger + add the durable cursor/revision + monitoring.
+Awaiting Alan's go on step 1 before applying anything.
 
 ---
 
